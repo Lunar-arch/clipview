@@ -2,18 +2,45 @@
   "name": "screensnip",
   "version": "0.1.0",
   "private": false,
-  "type": "module",
   "description": "Playwright screenshot capture and live streaming for local and remote development workflows.",
-  "bin": {
-    "screensnip": "packages/screenshot-kit/cli.mjs"
+  "keywords": [
+    "screenshots",
+    "playwright",
+    "cli",
+    "browser",
+    "automation",
+    "screenshot",
+    "capture",
+    "streaming",
+    "devtools",
+    "localhost",
+    "web",
+    "preview",
+    "visual",
+    "testing"
+  ],
+  "homepage": "https://github.com/Lunar-arch/screensnip#readme",
+  "bugs": {
+    "url": "https://github.com/Lunar-arch/screensnip/issues"
   },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Lunar-arch/screensnip.git"
+  },
+  "license": "MIT",
+  "author": "Nathan Barcroft",
+  "type": "module",
   "exports": {
     ".": "packages/screenshot-kit/index.mjs"
+  },
+  "bin": {
+    "screensnip": "packages/screenshot-kit/cli.mjs"
   },
   "files": [
     "packages/screenshot-kit",
     "screensnip.config.example.json",
-    "README.md"
+    "README.md",
+    "LICENSE"
   ],
   "scripts": {
     "screensnip": "node packages/screenshot-kit/cli.mjs",
@@ -23,6 +50,7 @@
   "dependencies": {
     "playwright": "^1.59.1"
   },
+  "devDependencies": {},
   "engines": {
     "node": ">=18.17"
   }
