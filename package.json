@@ -1,0 +1,29 @@
+{
+  "name": "screensnip",
+  "version": "0.1.0",
+  "private": false,
+  "type": "module",
+  "description": "Playwright screenshot capture and live streaming for local and remote development workflows.",
+  "bin": {
+    "screensnip": "packages/screenshot-kit/cli.mjs"
+  },
+  "exports": {
+    ".": "packages/screenshot-kit/index.mjs"
+  },
+  "files": [
+    "packages/screenshot-kit",
+    "screensnip.config.example.json",
+    "README.md"
+  ],
+  "scripts": {
+    "screensnip": "node packages/screenshot-kit/cli.mjs",
+    "screensnip:stream": "node packages/screenshot-kit/cli.mjs --stream --folderName live",
+    "check": "node --check packages/screenshot-kit/index.mjs && node --check packages/screenshot-kit/cli.mjs"
+  },
+  "dependencies": {
+    "playwright": "^1.59.1"
+  },
+  "engines": {
+    "node": ">=18.17"
+  }
+}

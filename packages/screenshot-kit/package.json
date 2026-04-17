@@ -1,0 +1,16 @@
+{
+  "name": "screensnip-internal",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Playwright screenshot automation toolkit with dev-server, URL, and local file modes.",
+  "bin": {
+    "screensnip": "./cli.mjs"
+  },
+  "exports": {
+    ".": "./index.mjs"
+  },
+  "peerDependencies": {
+    "playwright": "^1.59.1"
+  }
+}

@@ -1,0 +1,12 @@
+{
+  "port": 3000,
+  "pageLoadTimeoutMs": 60000,
+  "devUrlTimeoutMs": 90000,
+  "waitForTimeout": 15000,
+  "streamPollMs": 700,
+  "minIntervalMs": 1200,
+  "debounceMs": 300,
+  "maxHistory": 5,
+  "latestName": "latest.png",
+  "stableAfterLoadMs": 120
+}
