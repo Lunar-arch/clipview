@@ -1,17 +1,38 @@
 # clipview
 
-`clipview` is a Playwright-based CLI and API for automated screenshots, including a live visual streaming mode designed for development environments where direct browser access is limited.
+clipview is a Playwright-based screenshot and stream CLI for local development workflows. It can either capture a reachable URL, or it can act as a dev-server wrapper that starts or attaches to an app, finds the port, and keeps taking screenshots as the page changes.
 
-## What It Does
+## How It Works
 
-- Captures screenshots from a dev server, URL, local file, or HTML file.
-- Supports scrolling automation and viewport presets.
-- Provides live stream mode with:
-	- automatic rerender detection
-	- debounce + min interval controls
-	- rolling history cleanup
-	- continuously overwrites `latest.png` for quick preview in your IDE
-	- browser console and page error logging when enabled
+The package has three layers:
+
+- The CLI entrypoint in [packages/screenshot-kit/cli.mjs](packages/screenshot-kit/cli.mjs) parses `clipview`, `clipview dev`, `clipview attach`, and `clipview setup`.
+- The runtime in [packages/screenshot-kit/index.mjs](packages/screenshot-kit/index.mjs) launches Playwright, resolves the target URL, and captures screenshots.
+- The onboarding flow in [packages/screenshot-kit/onboarding.mjs](packages/screenshot-kit/onboarding.mjs) asks for a preferred dev command, port, and output style, then stores those defaults in a local config file.
+
+That split matters because `clipview dev` is not just a screenshot command. It is a wrapper that:
+
+1. Detects the likely framework from `package.json`.
+2. Infers a probable dev command from scripts and dependencies.
+3. Starts the dev server.
+4. Watches stdout and stderr for a URL or port.
+5. Falls back to config or common port scanning if the server does not print a usable URL.
+6. Attaches capture streaming once the server is ready.
+
+`clipview attach` uses the same capture pipeline, but it skips spawning a dev server and connects to an already running one.
+
+## Features
+
+- Framework-aware dev lifecycle wrapper via `clipview dev`.
+- Attach mode via `clipview attach`.
+- Stdout-driven port detection with config and scan fallbacks.
+- Interactive onboarding for dev command, preferred port, and output mode.
+- Output modes:
+  - `--mode structured` for cleaner logs.
+  - `--mode raw` for passthrough logs.
+- Multi-route support:
+  - `clipview dev --path / /dashboard /settings`
+- Browser console mirroring with `--browserConsole`.
 
 ## Install
 
@@ -19,58 +40,84 @@
 npm install -g clipview
 ```
 
-`clipview` depends on Playwright. A normal install should bring in Chromium automatically, but if browser downloads are disabled in your environment, run:
+On interactive installs, setup asks for:
+
+- preferred dev command
+- preferred dev port
+- clean output mode
+
+If clean output is enabled, clipview can install `concurrently` for the project after install completes. If browser binaries are missing:
 
 ```bash
 npx playwright install chromium
 ```
 
-## CLI Usage
-
-Run the CLI directly from the repo:
+## Commands
 
 ```bash
-npm run clipview -- --help
+clipview [target] [options]
+clipview dev [options]
+clipview attach [options]
+clipview setup
 ```
 
-Quick one-shot example:
+- `clipview dev`:
+  - detects likely framework names such as Next.js, Nuxt, Vite, React, Vue, SvelteKit, Astro, Remix, Angular, and more
+  - infers a likely dev command from `package.json`
+  - starts the server and listens for the actual port or URL in output
+  - auto-starts streaming once the app is reachable
+
+- `clipview attach`:
+  - connects to an existing local server
+  - resolves the target in this order: explicit `--port`, config `port`, then common port scanning
+  - auto-starts streaming once the server responds
+
+- `clipview setup`:
+  - reruns onboarding manually
+
+## Common Workflows
+
+One-shot screenshot from a live site:
 
 ```bash
-npm run clipview -- https://example.com --path / --sizes lg
+clipview https://example.com --capture viewport --name landing
 ```
 
-Live stream mode:
+Dev server wrapper with multiple routes:
 
 ```bash
-npm run clipview:stream -- localhost:3000 --path /
+clipview dev --path / /dashboard /settings --mode structured
 ```
 
-Minimal command, using defaults configurable in `clipview.config.json`:
+Attach to an already running app:
 
 ```bash
-npm run clipview -- --stream
+clipview attach --port 5173 --path /
 ```
 
-Default stream assumptions:
-
-- target URL: `http://localhost:3000`
-- output: `./screenshots/live`
-- rolling max history: `5`
-- min interval: `1200ms`
-- debounce: `300ms`
-- poll interval: `700ms`
-
-Or with explicit controls:
+Local file mode:
 
 ```bash
-npm run clipview -- localhost:3000 --stream --path /dashboard --outDir screenshots --folderName live --maxHistory 80 --minInterval 1500 --debounce 400 --streamPoll 1000 --browserConsole
+clipview --file ./dist/index.html --scroll selectors --scrollSelectors "#hero,#pricing"
 ```
 
-## Config File
+## Output Modes
 
-`clipview` reads defaults from a JSON config file in the current working directory.
+`--mode raw` writes server output as-is. `--mode structured` rewrites the most useful lines into a cleaner, easier-to-scan format.
 
-Supported file names:
+Typical structured output looks like this:
+
+```text
+GET / 200 | Saved
+GET /api/data 400
+Error failed to fetch data
+```
+
+This mode is intentionally conservative. It keeps meaningful request and error lines, while hiding some noisy framework internals where possible. The first formatter is tuned for Next.js-style logs, and it is meant to grow over time.
+
+## Configuration
+
+clipview reads defaults from JSON in the current working directory:
 
 - `clipview.config.json`
 - `.clipviewrc.json`
@@ -81,6 +128,10 @@ Example:
 ```json
 {
 	"port": 3000,
+	"devCommand": "npm run dev",
+	"mode": "structured",
+	"paths": ["/", "/dashboard", "/settings"],
+	"attachPorts": [3000, 3001, 5173, 5174, 8080, 4200],
 	"pageLoadTimeoutMs": 60000,
 	"devUrlTimeoutMs": 90000,
 	"waitForTimeout": 15000,
@@ -88,42 +139,21 @@ Example:
 	"minIntervalMs": 1200,
 	"debounceMs": 300,
 	"maxHistory": 5,
-	"latestName": "latest.png"
+	"latestName": "latest.png",
+	"stableAfterLoadMs": 120
 }
 ```
 
-Command-line flags always override config file values.
+CLI flags always override config values. The onboarding flow writes the same config file so the package remembers your defaults after the first interactive install.
 
-## Stream Mode Behavior
+## Stream Behavior
 
-- Polls and reloads target page continuously.
-- Detects rerenders by page signature changes.
-- Debounces rapid updates and enforces a minimum capture interval.
-- Saves rolling history as `stream-000001.png`, `stream-000002.png`, etc.
-- Updates `latest.png` on each capture.
-- Deletes oldest files once `--maxHistory` is exceeded.
-- Waits for stable states before capture (`readyState`, load state, best-effort network idle).
-- If a page returns a 404 or other HTTP error, the response is logged and the page can still be captured.
-- Use `--browserConsole` to mirror browser console output, page errors, and failed requests into the CLI.
+- Stream mode stores rolling history and updates `latest.png` on every capture.
+- Multi-route stream mode cycles through every provided route.
+- `--browserConsole` mirrors browser console output, page errors, and failed requests into the terminal.
+- `--streamReload` forces reload-based polling instead of the page-mutation observer.
 
-## Key Options
-
-- `--stream`
-- `--live` (alias for `--stream`)
-- `--streamPoll <ms>`
-- `--debounce <ms>`
-- `--minInterval <ms>`
-- `--maxHistory <count>`
-- `--latestName <file>`
-- `--stableWait <ms>`
-- `--outDir <dir>`
-- `--folderName <name>`
-- `--browserConsole`
-- `--config <file>`
-
-Run `--help` for the full option set.
-
-## API and Command Module Contract
+## Command Module Contract
 
 Command modules can export `default` or `run` async function and receive:
 

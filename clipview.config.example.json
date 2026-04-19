@@ -1,5 +1,9 @@
 {
   "port": 3000,
+  "devCommand": "npm run dev",
+  "mode": "structured",
+  "paths": ["/", "/dashboard", "/settings"],
+  "attachPorts": [3000, 3001, 5173, 5174, 4173, 4174, 8080, 8081, 4200, 4321, 8000],
   "pageLoadTimeoutMs": 60000,
   "devUrlTimeoutMs": 90000,
   "waitForTimeout": 15000,

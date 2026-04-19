@@ -6,10 +6,18 @@ import path from "node:path";
 import process from "node:process";
 import { pathToFileURL } from "node:url";
 import { chromium } from "playwright";
+import { createDevOutputFormatter } from "./dev-output.mjs";
+import {
+  detectProjectContext,
+  inferDevCommand,
+  inferSuggestedPort,
+} from "./framework-detection.mjs";
+import { maybeRunOnboarding } from "./onboarding.mjs";
 
 const DEFAULTS = {
   source: "dev",
   path: "/",
+  paths: ["/"],
   outDir: "screenshots",
   sizes: ["lg"],
   scroll: "none",
@@ -33,6 +41,9 @@ const DEFAULTS = {
   stableAfterLoadMs: 120,
   streamReload: false,
   defaultStreamUrl: "http://localhost:3000",
+  mode: "raw",
+  devCommand: null,
+  attachPorts: [3000, 3001, 5173, 5174, 4173, 4174, 8080, 8081, 4200, 4321, 8000],
 };
 
 const BREAKPOINTS = {
@@ -69,6 +80,58 @@ function normalizeRoute(input) {
     return "/";
   }
   return input.startsWith("/") ? input : `/${input}`;
+}
+
+function normalizeRouteList(value) {
+  if (!value) {
+    return [];
+  }
+
+  if (Array.isArray(value)) {
+    return value.map((item) => normalizeRoute(String(item).trim())).filter(Boolean);
+  }
+
+  if (typeof value === "string") {
+    return parseList(value).map((item) => normalizeRoute(item));
+  }
+
+  return [];
+}
+
+function routeToLabel(route) {
+  if (!route || route === "/") {
+    return "root";
+  }
+
+  return route
+    .replace(/^\/+/, "")
+    .replace(/[^a-zA-Z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .toLowerCase() || "route";
+}
+
+function extractPortFromText(input) {
+  const directUrl = input.match(/https?:\/\/[\w.:[\]-]+:(\d{2,5})/i);
+  if (directUrl?.[1]) {
+    return Number(directUrl[1]);
+  }
+
+  const nextStyle = input.match(/started server on[^\d]*(\d{2,5})/i);
+  if (nextStyle?.[1]) {
+    return Number(nextStyle[1]);
+  }
+
+  const localStyle = input.match(/local:\s*https?:\/\/[\w.:[\]-]+:(\d{2,5})/i);
+  if (localStyle?.[1]) {
+    return Number(localStyle[1]);
+  }
+
+  const listenStyle = input.match(/listening on[^\d]*(\d{2,5})/i);
+  if (listenStyle?.[1]) {
+    return Number(listenStyle[1]);
+  }
+
+  return null;
 }
 
 function parseList(input) {
@@ -175,21 +238,25 @@ function parseViewportToken(token) {
 
 export async function parseScreenshotArgs(argv, baseOptions = {}) {
   const configDefaults = await loadConfigDefaults(argv);
+  const baseSource = typeof baseOptions.source === "string" ? baseOptions.source : null;
   const options = {
     ...DEFAULTS,
     ...configDefaults,
     ...baseOptions,
     help: false,
-    commands: null,
-    port: null,
-    name: null,
-    url: null,
-    file: null,
-    htmlFile: null,
-    folderName: null,
-    waitFor: [],
-    scrollSelectors: [],
-    browserConsole: false,
+    commands: baseOptions.commands ?? configDefaults.commands ?? null,
+    port: baseOptions.port ?? configDefaults.port ?? null,
+    name: baseOptions.name ?? configDefaults.name ?? null,
+    url: baseOptions.url ?? configDefaults.url ?? null,
+    file: baseOptions.file ?? configDefaults.file ?? null,
+    htmlFile: baseOptions.htmlFile ?? configDefaults.htmlFile ?? null,
+    folderName: baseOptions.folderName ?? configDefaults.folderName ?? null,
+    waitFor: normalizeListOption(baseOptions.waitFor ?? configDefaults.waitFor ?? []),
+    scrollSelectors: normalizeListOption(baseOptions.scrollSelectors ?? configDefaults.scrollSelectors ?? []),
+    browserConsole: Boolean(baseOptions.browserConsole ?? configDefaults.browserConsole ?? false),
+    devCommand: baseOptions.devCommand ?? configDefaults.devCommand ?? null,
+    mode: String(baseOptions.mode ?? configDefaults.mode ?? DEFAULTS.mode).toLowerCase(),
+    paths: normalizeRouteList(baseOptions.paths ?? configDefaults.paths ?? []),
   };
 
   let positionalTarget = null;
@@ -224,7 +291,19 @@ export async function parseScreenshotArgs(argv, baseOptions = {}) {
     }
 
     if (arg === "--path" || arg === "--directory" || arg === "-d") {
-      options.path = normalizeRoute(argv[++i]);
+      if (!argv[i + 1] || argv[i + 1].startsWith("-")) {
+        throw new Error("--path requires at least one route value.");
+      }
+
+      options.paths = options.paths ?? [];
+      while (i + 1 < argv.length && !argv[i + 1].startsWith("-")) {
+        i += 1;
+        options.paths.push(normalizeRoute(argv[i]));
+      }
+
+      if (options.paths.length > 0) {
+        options.path = options.paths[0];
+      }
       continue;
     }
 
@@ -409,6 +488,24 @@ export async function parseScreenshotArgs(argv, baseOptions = {}) {
       continue;
     }
 
+    if (arg === "--devCommand") {
+      const nextValue = argv[++i] ?? null;
+      if (!nextValue || nextValue.startsWith("-")) {
+        throw new Error("--devCommand requires a command string.");
+      }
+      options.devCommand = nextValue;
+      continue;
+    }
+
+    if (arg === "--mode") {
+      const mode = String(argv[++i] ?? DEFAULTS.mode).toLowerCase();
+      if (!["structured", "raw"].includes(mode)) {
+        throw new Error("--mode must be one of: structured, raw.");
+      }
+      options.mode = mode;
+      continue;
+    }
+
     if (arg === "--browserConsole" || arg === "--browser-console") {
       options.browserConsole = true;
       continue;
@@ -437,6 +534,8 @@ export async function parseScreenshotArgs(argv, baseOptions = {}) {
 
   if (explicitSourceKind) {
     options.source = explicitSourceKind;
+  } else if (baseSource) {
+    options.source = baseSource;
   } else if (options.url) {
     options.source = "url";
   } else if (options.file) {
@@ -452,6 +551,17 @@ export async function parseScreenshotArgs(argv, baseOptions = {}) {
   options.sizes = normalizeListOption(options.sizes);
   options.waitFor = normalizeListOption(options.waitFor);
   options.scrollSelectors = normalizeListOption(options.scrollSelectors);
+  options.paths = normalizeRouteList(options.paths);
+
+  if (options.paths.length === 0) {
+    options.paths = [normalizeRoute(options.path)];
+  }
+
+  options.path = options.paths[0];
+
+  if (!["structured", "raw"].includes(options.mode)) {
+    throw new Error("--mode must be one of: structured, raw.");
+  }
 
   if (!options.latestName.toLowerCase().endsWith(".png")) {
     throw new Error("--latestName must end with .png.");
@@ -461,18 +571,27 @@ export async function parseScreenshotArgs(argv, baseOptions = {}) {
 }
 
 export function printHelp() {
-  console.log(`Usage: clipview [target] [options]
+  console.log(`Usage:
+  clipview [target] [options]
+  clipview dev [options]
+  clipview attach [options]
+  clipview setup
 
-Capture Playwright screenshots from a dev server, direct URL, local file URL, or raw HTML.
+Subcommands:
+  dev                      Start a detected dev server and stream captures automatically.
+  attach                   Attach to an already-running dev server, then stream.
+  setup                    Run onboarding prompts (dev command, port, output mode).
 
 Core options:
   -c, --commands <file>      Path to a Playwright command module.
   -C, --config <file>        Load defaults from a JSON config file.
-  -p, --port <number>        Request a specific dev port (dev source only).
-  -d, --path <route>         Route/path to visit. Default: /
+  -p, --port <number>        Preferred port for dev/attach flows.
+  -d, --path <route...>      One or more routes. Supports repeated flags or a route list.
   -o, --outDir <dir>         Output base directory. Default: screenshots
   -n, --name <name>          Base screenshot name.
   -s, --sizes <sizes>        Comma list: sm,md,lg,xl or WIDTHxHEIGHT. Default: lg
+      --devCommand <cmd>     Explicit command used when source is dev.
+      --mode <mode>          structured or raw. Default: raw
 
 Source options:
       --url <https://...>    Capture from an already reachable URL.
@@ -506,56 +625,20 @@ Live stream mode:
       --maxHistory <count>   Keep only newest N stream images. Default: 5
   --latestName <file>    Overwritten on every capture. Default: latest.png
   --stableWait <ms>      Extra settle delay after load-state checks. Default: 120
-  --streamReload         Force legacy reload polling (not recommended for dev/HMR).
+  --streamReload         Force legacy reload polling.
       --browserConsole       Mirror browser console, page errors, and request failures.
-
-Default stream target:
-  If --stream is used with no explicit source, it defaults to http://localhost:3000.
-  You can also pass the target positionally:
-  clipview localhost:3000 --stream
 
 Examples:
   clipview --sizes sm,lg --scroll page
   clipview https://example.com --capture viewport --name landing
-  clipview --file ./dist/index.html --scroll selectors --scrollSelectors "#hero,#pricing"
-  clipview --htmlFile ./snapshots/mock.html --waitFor "#app"
-  clipview localhost:3000 --stream --browserConsole
-  clipview --stream --port 3000 --path / --maxHistory 100 --minInterval 1500
+  clipview dev --path / /dashboard /settings --mode structured
+  clipview attach --mode structured
+  clipview attach --port 5173 --path /
 
 Command file contract:
   Export an async function (default export or named 'run').
   It receives: { page, context, browser, baseUrl, outDir, playwright, options, helpers, log }.
 `);
-}
-
-function getDevCommand(port) {
-  const userAgent = process.env.npm_config_user_agent ?? "";
-
-  if (userAgent.startsWith("pnpm/")) {
-    return {
-      command: "pnpm",
-      args: ["dev", ...(port ? ["--port", String(port)] : [])],
-    };
-  }
-
-  if (userAgent.startsWith("yarn/")) {
-    return {
-      command: "yarn",
-      args: ["dev", ...(port ? ["--port", String(port)] : [])],
-    };
-  }
-
-  if (userAgent.startsWith("bun/")) {
-    return {
-      command: "bun",
-      args: ["run", "dev", ...(port ? ["--port", String(port)] : [])],
-    };
-  }
-
-  return {
-    command: "npm",
-    args: ["run", "dev", ...(port ? ["--", "--port", String(port)] : [])],
-  };
 }
 
 function normalizeDevUrl(rawUrl) {
@@ -567,50 +650,108 @@ function normalizeDevUrl(rawUrl) {
 }
 
 function extractUrlFromChunk(chunk) {
-  const match = chunk.match(/https?:\/\/[\w.:\-\[\]]+/);
-  return match ? match[0] : null;
+  const matches = chunk.match(/https?:\/\/[^\s"')]+/gi) ?? [];
+  for (const candidate of matches) {
+    try {
+      return normalizeDevUrl(candidate.replace(/[.,;:]$/, ""));
+    } catch {
+      // Ignore invalid URL tokens in noisy logs.
+    }
+  }
+  return null;
 }
 
-function waitForDevUrl(devProcess, requestedPort, timeoutMs) {
+function waitForDevUrl(devProcess, config) {
+  const {
+    requestedPort,
+    fallbackPort,
+    timeoutMs,
+    formatter,
+  } = config;
+
   return new Promise((resolve, reject) => {
     let settled = false;
 
-    const timer = setTimeout(() => {
-      if (settled) {
-        return;
+    const flushFormatter = () => {
+      const trailing = formatter?.flush?.();
+      if (trailing) {
+        process.stdout.write(trailing);
       }
-      settled = true;
-      if (requestedPort) {
-        resolve(`http://localhost:${requestedPort}`);
-        return;
-      }
-      reject(new Error("Timed out waiting for dev server URL in output. Use --port to force a known URL."));
-    }, timeoutMs);
+    };
 
-    const onData = (data) => {
+    const finish = (result, error) => {
       if (settled) {
         return;
       }
-      const extracted = extractUrlFromChunk(data.toString());
-      if (!extracted) {
-        return;
-      }
+
       settled = true;
       clearTimeout(timer);
-      resolve(normalizeDevUrl(extracted));
+      devProcess.stdout.off("data", onStdoutData);
+      devProcess.stderr.off("data", onStderrData);
+      devProcess.off("exit", onExit);
+      flushFormatter();
+
+      if (error) {
+        reject(error);
+        return;
+      }
+
+      resolve(result);
+    };
+
+    const timer = setTimeout(() => {
+      if (requestedPort) {
+        finish(`http://localhost:${requestedPort}`);
+        return;
+      }
+      if (fallbackPort) {
+        finish(`http://localhost:${fallbackPort}`);
+        return;
+      }
+
+      finish(null, new Error("Timed out waiting for dev server URL in output. Use --port or config fallback."));
+    }, timeoutMs);
+
+    const handleData = (data) => {
+      if (settled) {
+        return;
+      }
+
+      const output = data.toString();
+      const extracted = extractUrlFromChunk(output);
+      if (!extracted) {
+        const extractedPort = extractPortFromText(output);
+        if (extractedPort) {
+          finish(`http://localhost:${extractedPort}`);
+        }
+        return;
+      }
+
+      finish(extracted);
+    };
+
+    const onStdoutData = (data) => {
+      const next = formatter ? formatter.formatStdout(data) : data.toString();
+      if (next) {
+        process.stdout.write(next);
+      }
+      handleData(data);
+    };
+
+    const onStderrData = (data) => {
+      const next = formatter ? formatter.formatStderr(data) : data.toString();
+      if (next) {
+        process.stderr.write(next);
+      }
+      handleData(data);
     };
 
     const onExit = (code) => {
-      if (settled) {
-        return;
-      }
-      settled = true;
-      clearTimeout(timer);
-      reject(new Error(`Dev server exited before URL was found (exit code ${code}).`));
+      finish(null, new Error(`Dev server exited before URL was found (exit code ${code}).`));
     };
 
-    devProcess.stdout.on("data", onData);
-    devProcess.stderr.on("data", onData);
+    devProcess.stdout.on("data", onStdoutData);
+    devProcess.stderr.on("data", onStderrData);
     devProcess.once("exit", onExit);
   });
 }
@@ -650,7 +791,7 @@ function createFolderName() {
 
 function createScreenshotName(index, customName, label, multiple, format) {
   let filename = customName ? customName.replace(/[^a-zA-Z0-9_-]+/g, "-") : `screenshot${index}`;
-  if (multiple) {
+  if (multiple && label) {
     filename += `-${label}`;
   }
   return `${filename}.${format}`;
@@ -714,6 +855,45 @@ export async function autoScrollSelectors(page, selectors, config = {}) {
   }
 }
 
+async function isReachableHttpUrl(url, timeoutMs = 1200) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    const response = await fetch(url, {
+      method: "GET",
+      redirect: "manual",
+      signal: controller.signal,
+    });
+
+    return response.status < 500;
+  } catch {
+    return false;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function resolveAttachUrl(options) {
+  if (options.url) {
+    return options.url.replace(/\/$/, "");
+  }
+
+  if (options.port) {
+    return `http://localhost:${options.port}`;
+  }
+
+  for (const port of options.attachPorts) {
+    const candidate = `http://localhost:${port}`;
+    // Keep attach mode resilient by scanning common framework defaults quickly.
+    if (await isReachableHttpUrl(candidate)) {
+      return candidate;
+    }
+  }
+
+  throw new Error("Attach mode could not find a reachable dev server. Try --port or set port in config.");
+}
+
 async function prepareSource(options) {
   if (options.source === "url") {
     if (!options.url) {
@@ -747,6 +927,11 @@ async function prepareSource(options) {
 
     const html = await fs.readFile(absolutePath, "utf8");
     return { baseUrl: "about:blank", targetKind: "content", html };
+  }
+
+  if (options.source === "attach") {
+    const attachUrl = await resolveAttachUrl(options);
+    return { baseUrl: attachUrl, targetKind: "goto" };
   }
 
   return { baseUrl: null, targetKind: "goto" };
@@ -1032,7 +1217,7 @@ async function getPageSignature(page) {
 async function trimStreamHistory(outDir, maxHistory) {
   const entries = await fs.readdir(outDir, { withFileTypes: true });
   const historyFiles = entries
-    .filter((entry) => entry.isFile() && /^stream-\d{6}\.png$/i.test(entry.name))
+    .filter((entry) => entry.isFile() && /^stream(?:-[a-z0-9-]+)?-\d{6}\.png$/i.test(entry.name))
     .map((entry) => entry.name)
     .sort();
 
@@ -1187,11 +1372,135 @@ async function runStreamScreenshotTask({
   }
 }
 
+async function runMultiRouteStreamTask({
+  browser,
+  context,
+  page,
+  baseUrl,
+  outDir,
+  options,
+  sourceInfo,
+  targets,
+  viewport,
+}) {
+  let sequence = 0;
+  let shouldStop = false;
+  let lastCaptureAt = 0;
+  const signatures = new Map();
+
+  const onStop = () => {
+    shouldStop = true;
+  };
+
+  process.once("SIGINT", onStop);
+  process.once("SIGTERM", onStop);
+
+  const captureNow = async (target) => {
+    const waitMs = Math.max(0, options.minIntervalMs - (Date.now() - lastCaptureAt));
+    if (waitMs > 0) {
+      await sleep(waitMs);
+    }
+
+    await applyScrollStrategy(page, options);
+
+    sequence += 1;
+    const slug = routeToLabel(target.route);
+    const historyFile = `stream-${slug}-${String(sequence).padStart(6, "0")}.png`;
+    const historyPath = path.join(outDir, historyFile);
+    const latestPath = path.join(outDir, options.latestName);
+
+    await page.screenshot(buildScreenshotConfig(historyPath, options));
+    await fs.copyFile(historyPath, latestPath);
+    await trimStreamHistory(outDir, options.maxHistory);
+
+    lastCaptureAt = Date.now();
+    console.log(`Saved stream screenshot (${target.route}): ${historyPath}`);
+    console.log(`Updated latest: ${latestPath}`);
+  };
+
+  const logStreamError = (target, error) => {
+    const message = error instanceof Error ? error.message : String(error);
+    console.warn(`[stream:${target.route}] ${message}`);
+  };
+
+  try {
+    await page.setViewportSize(viewport);
+
+    while (!shouldStop) {
+      for (const target of targets) {
+        if (shouldStop) {
+          break;
+        }
+
+        try {
+          await runCapturePreparation({
+            browser,
+            context,
+            page,
+            baseUrl,
+            outDir,
+            options,
+            sourceInfo,
+            targetUrl: target.url,
+          });
+
+          const nextSignature = await getPageSignature(page);
+          const previousSignature = signatures.get(target.route);
+          signatures.set(target.route, nextSignature);
+
+          if (!previousSignature || previousSignature !== nextSignature) {
+            await ensurePageStable(page, options);
+            await captureNow(target);
+          }
+        } catch (error) {
+          logStreamError(target, error);
+        }
+
+        await sleep(options.streamPollMs);
+      }
+    }
+
+    console.log("Stream mode stopped.");
+  } finally {
+    process.removeListener("SIGINT", onStop);
+    process.removeListener("SIGTERM", onStop);
+  }
+}
+
 export async function runScreenshotTask(rawOptions) {
-  const options = {
+  const projectDir = process.cwd();
+  let options = {
     ...DEFAULTS,
     ...rawOptions,
   };
+
+  if ((options.source === "dev" || options.source === "attach") && !process.env.CLIPVIEW_SKIP_ONBOARDING) {
+    const onboardingConfig = await maybeRunOnboarding({
+      projectDir,
+      reason: "runtime",
+    });
+
+    if (onboardingConfig && typeof onboardingConfig === "object") {
+      options = {
+        ...DEFAULTS,
+        ...onboardingConfig,
+        ...rawOptions,
+      };
+    }
+  }
+
+  options.paths = normalizeRouteList(options.paths);
+  if (options.paths.length === 0) {
+    options.paths = [normalizeRoute(options.path)];
+  }
+  options.path = options.paths[0];
+
+  options.mode = String(options.mode ?? DEFAULTS.mode).toLowerCase() === "structured" ? "structured" : "raw";
+  options.attachPorts = Array.isArray(options.attachPorts)
+    ? options.attachPorts
+      .map((value) => Number(value))
+      .filter((value) => Number.isInteger(value) && value > 0)
+    : [...DEFAULTS.attachPorts];
 
   if (options.stream && options.source === "html") {
     throw new Error("--stream does not support --htmlFile. Use dev/url/file sources instead.");
@@ -1213,18 +1522,41 @@ export async function runScreenshotTask(rawOptions) {
   let devProcess;
   let baseUrl = sourceInfo.baseUrl;
   let detachBrowserLogging = null;
+  let projectContext = null;
   if (options.source === "dev") {
-    const { command, args } = getDevCommand(options.port);
-    devProcess = spawn(command, args, {
-      cwd: process.cwd(),
-      env: process.env,
+    projectContext = await detectProjectContext(projectDir);
+    const preferredPort = inferSuggestedPort(projectContext, options.port ?? null);
+    const commandInfo = inferDevCommand(projectContext, {
+      configuredCommand: options.devCommand,
+      requestedPort: preferredPort,
+    });
+
+    const env = {
+      ...process.env,
+      ...(preferredPort ? { PORT: String(preferredPort) } : {}),
+    };
+
+    console.log(`[clipview] ${projectContext.framework.name} detected`);
+    console.log(`[clipview] starting dev server: ${commandInfo.command}`);
+
+    devProcess = spawn(commandInfo.command, {
+      cwd: projectDir,
+      env,
       stdio: ["ignore", "pipe", "pipe"],
       shell: true,
     });
 
-    devProcess.stdout.pipe(process.stdout);
-    devProcess.stderr.pipe(process.stderr);
-    baseUrl = await waitForDevUrl(devProcess, options.port, options.devUrlTimeoutMs);
+    const formatter = createDevOutputFormatter(options.mode, projectContext.framework.id);
+    baseUrl = await waitForDevUrl(devProcess, {
+      requestedPort: options.port,
+      fallbackPort: preferredPort,
+      timeoutMs: options.devUrlTimeoutMs,
+      formatter,
+    });
+  }
+
+  if (options.source === "attach") {
+    console.log(`[clipview] attach connected: ${baseUrl}`);
   }
 
   let browser;
@@ -1234,54 +1566,91 @@ export async function runScreenshotTask(rawOptions) {
     const page = await context.newPage();
     detachBrowserLogging = attachBrowserLogging(page, options.browserConsole);
 
-    const targetUrl = sourceInfo.targetKind === "goto"
-      ? new URL(options.path, `${baseUrl}/`).toString()
-      : baseUrl;
+    const targets = sourceInfo.targetKind === "goto"
+      ? options.paths.map((route) => ({
+        route,
+        url: new URL(route, `${baseUrl}/`).toString(),
+      }))
+      : [{ route: options.path, url: baseUrl }];
 
     if (options.stream) {
       if (parsedSizes.length > 1) {
         console.warn("[stream] Multiple sizes provided; stream mode uses the first viewport only.");
       }
 
-      await runStreamScreenshotTask({
-        browser,
-        context,
-        page,
-        baseUrl,
-        outDir,
-        options,
-        sourceInfo,
-        targetUrl,
-        viewport: parsedSizes[0].viewport,
-      });
+      if (targets.length > 1) {
+        await runMultiRouteStreamTask({
+          browser,
+          context,
+          page,
+          baseUrl,
+          outDir,
+          options,
+          sourceInfo,
+          targets,
+          viewport: parsedSizes[0].viewport,
+        });
+      } else {
+        await runStreamScreenshotTask({
+          browser,
+          context,
+          page,
+          baseUrl,
+          outDir,
+          options,
+          sourceInfo,
+          targetUrl: targets[0].url,
+          viewport: parsedSizes[0].viewport,
+        });
+      }
 
       return { outDir, baseUrl, mode: "stream" };
     }
 
-    const multiple = parsedSizes.length > 1;
+    const multiple = parsedSizes.length > 1 || targets.length > 1;
+    let screenshotIndex = 0;
 
     for (let i = 0; i < parsedSizes.length; i += 1) {
       const size = parsedSizes[i];
       await page.setViewportSize(size.viewport);
 
-      await runCapturePreparation({
-        browser,
-        context,
-        page,
-        baseUrl,
-        outDir,
-        options,
-        sourceInfo,
-        targetUrl,
-      });
+      for (const target of targets) {
+        await runCapturePreparation({
+          browser,
+          context,
+          page,
+          baseUrl,
+          outDir,
+          options,
+          sourceInfo,
+          targetUrl: target.url,
+        });
 
-      await applyScrollStrategy(page, options);
+        await applyScrollStrategy(page, options);
 
-      const filename = createScreenshotName(i + 1, options.name, size.label, multiple, options.format);
-      const screenshotPath = path.join(outDir, filename);
+        screenshotIndex += 1;
 
-      await page.screenshot(buildScreenshotConfig(screenshotPath, options));
-      console.log(`Saved screenshot: ${screenshotPath}`);
+        const labelParts = [];
+        if (parsedSizes.length > 1) {
+          labelParts.push(size.label);
+        }
+        if (targets.length > 1) {
+          labelParts.push(routeToLabel(target.route));
+        }
+
+        const variantLabel = labelParts.join("-") || size.label;
+        const filename = createScreenshotName(
+          screenshotIndex,
+          options.name,
+          variantLabel,
+          multiple,
+          options.format
+        );
+        const screenshotPath = path.join(outDir, filename);
+
+        await page.screenshot(buildScreenshotConfig(screenshotPath, options));
+        console.log(`Saved screenshot (${target.route}): ${screenshotPath}`);
+      }
     }
 
     return { outDir, baseUrl };

@@ -45,7 +45,8 @@
   "scripts": {
     "clipview": "node packages/screenshot-kit/cli.mjs",
     "clipview:stream": "node packages/screenshot-kit/cli.mjs --stream --folderName live",
-    "check": "node --check packages/screenshot-kit/index.mjs && node --check packages/screenshot-kit/cli.mjs"
+    "check": "node --check packages/screenshot-kit/index.mjs && node --check packages/screenshot-kit/cli.mjs && node --check packages/screenshot-kit/framework-detection.mjs && node --check packages/screenshot-kit/dev-output.mjs && node --check packages/screenshot-kit/onboarding.mjs && node --check packages/screenshot-kit/setup.mjs",
+    "postinstall": "node packages/screenshot-kit/setup.mjs"
   },
   "dependencies": {
     "playwright": "^1.59.1"
